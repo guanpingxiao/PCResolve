@@ -1144,6 +1144,22 @@ class ProjectAnalyzer:
         func_name = call_dict.get('func_name', '')
         if not func_name:
             return func_name
+        base = normalize_source(call_dict.get('base'))
+        if isinstance(base, SuperMethod):
+            base_path = call_dict.get('super_base_path')
+            decorator_module = call_dict.get('super_decorator_module')
+            decorator_parts = decorator_module.split('.') if decorator_module else []
+            local_decorator = any(
+                self.is_local('.'.join(decorator_parts[:length]))
+                for length in range(1, len(decorator_parts) + 1)
+            )
+            if (isinstance(base_path, str) and base_path
+                    and not self.is_local(base_path.split('.')[0])
+                    and not local_decorator):
+                # Public import provenance is a display hint, not the
+                # method's runtime defining class or an importability claim.
+                return base_path + '.' + base.method
+            return func_name
         parts = func_name.split('.')
         first = parts[0]
 

@@ -693,6 +693,7 @@ class SingleFileAnalyzer(ast.NodeVisitor):
         self.local = set()
         self._func_stack = []
         self._class_stack = []
+        self._super_base_path_stack = []
         self._seen_api_call_ids = set()
         self._receiver_owner_guards = []
         self.defined_functions = set()
@@ -4936,6 +4937,22 @@ class SingleFileAnalyzer(ast.NodeVisitor):
             'end_col_offset': getattr(node, 'end_col_offset', 0) or 0,
             'scope_name': scope_name,
         }
+        if isinstance(normalize_source(base), SuperMethod):
+            # Snapshot the class-definition import path, before later
+            # rebinding or another same-named class can replace the evidence.
+            loc['super_base_path'] = None
+            receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+            if (isinstance(receiver, ast.Call)
+                    and isinstance(receiver.func, ast.Name)
+                    and receiver.func.id == 'super'
+                    and not receiver.args and not receiver.keywords
+                    and _is_unshadowed_builtin_call(self, receiver)
+                    and cs.kind == SCOPE_FUNCTION
+                    and cs.parent is not None and cs.parent.kind == SCOPE_CLASS
+                    and self._super_base_path_stack):
+                base_path, decorator_module = self._super_base_path_stack[-1]
+                loc['super_base_path'] = base_path
+                loc['super_decorator_module'] = decorator_module
         # 1.0.5 P0: snapshot call_assign_funcs for dotted calls so
         # cross-file _resolve_func_name reads the pre-assignment
         # state, not the final map that may include later
@@ -5868,9 +5885,84 @@ class SingleFileAnalyzer(ast.NodeVisitor):
             defaults=defaults,
         )
 
+    ## Qualify a name or attribute through its current lexical import binding.
+    #  @param root Expression evaluated in the defining scope.
+    #  @return Dotted import path, or None for non-import or ambiguous bindings.
+    def _definition_import_path(self, root):
+        attributes = []
+        while isinstance(root, ast.Attribute):
+            attributes.append(root.attr)
+            root = root.value
+        if not isinstance(root, ast.Name):
+            return None
+        binding = self.current_scope().lookup(root.id, skip_parent_classes=True)
+        if (binding is None or binding.binding_kind != 'import'
+                or not isinstance(normalize_source(binding.source), str)):
+            return None
+        imported = self._import_binding_sources.get(self._binding_key(binding))
+        if not isinstance(imported, str) or not imported:
+            return None
+        return '.'.join([imported] + list(reversed(attributes)))
+
+    ## Recognize the narrow Keras registration contract that returns its class.
+    #  @param node Class decorator expression.
+    #  @return True for a proven registration call with literal configuration.
+    def _is_class_preserving_keras_registration(self, node):
+        if (not isinstance(node, ast.Call)
+                or not isinstance(node.func, ast.Name)
+                or self.current_scope().kind != SCOPE_MODULE
+                or self.wildcard_modules
+                or self._definition_import_path(node.func)
+                != 'tensorflow.keras.utils.register_keras_serializable'):
+            return False
+        binding = self.current_scope().lookup(node.func.id)
+        statements = self._module_tree.body
+        if not any(isinstance(statement, ast.ImportFrom)
+                   and statement.lineno == binding.lineno
+                   for statement in statements):
+            return False
+        # Only accept an unconditional module import. Some unsupported writes
+        # (e.g. walrus or augmented assignment) retain an old import binding;
+        # reject visible writes rather than inheriting that stale identity.
+        for statement in statements:
+            if binding.lineno <= statement.lineno < node.lineno:
+                for item in ast.walk(statement):
+                    if (isinstance(item, ast.Name) and item.id == node.func.id
+                            and isinstance(item.ctx, (ast.Store, ast.Del))):
+                        return False
+        # TensorFlow v2.10.0 generic_utils.register_keras_serializable records
+        # the class in registries and returns the same arg. Keep this contract
+        # specific to that API; unknown decorators may replace the class.
+        if len(node.args) > 2:
+            return False
+        arguments = dict(zip(('package', 'name'), node.args))
+        for keyword in node.keywords:
+            if keyword.arg not in ('package', 'name') or keyword.arg in arguments:
+                return False
+            arguments[keyword.arg] = keyword.value
+        for name, value in arguments.items():
+            if not isinstance(value, ast.Constant):
+                return False
+            if not (isinstance(value.value, str)
+                    or (name == 'name' and value.value is None)):
+                return False
+        return True
+
+    ## Capture a simple single base's import path at class definition time.
+    #  @param node ClassDef node.
+    #  @return Import-backed dotted path, or None for unsupported inheritance.
+    def _super_base_import_path(self, node):
+        if len(node.bases) != 1 or node.keywords:
+            return None
+        if any(not self._is_class_preserving_keras_registration(decorator)
+               for decorator in node.decorator_list):
+            return None
+        return self._definition_import_path(node.bases[0])
+
     ## Visit a ClassDef node and register it with its method and base lists.
     #  @param node The ClassDef AST node.
     def visit_ClassDef(self, node):
+        super_base_path = self._super_base_import_path(node)
         self.local.add(node.name)
         self._bind_target_name(node.name, "local", node)
         methods = []
@@ -5899,10 +5991,16 @@ class SingleFileAnalyzer(ast.NodeVisitor):
             attrs={},
         )
         self._class_stack.append(node.name)
+        self._super_base_path_stack.append((
+            super_base_path,
+            'tensorflow.keras.utils'
+            if super_base_path and node.decorator_list else None,
+        ))
         self.push_scope(SCOPE_CLASS, node.name)
         self.generic_visit(node)
         self.pop_scope()
         self._class_stack.pop()
+        self._super_base_path_stack.pop()
         ## Populate ClassSummary attrs collected during class body visit.
         class_attrs = {}
         for (cn, attr_name), src in self.instance_attrs.items():

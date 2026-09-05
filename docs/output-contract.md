@@ -99,6 +99,20 @@ guaranteed precise resolution:
   otherwise the original receiver expression is preserved while
   `top_library` carries the ownership.
 - **Local / unknown**: stays as the original expression or `local`.
+- **Zero-argument `super()` methods**: for a statically known direct single
+  external base, the hint uses the base's import path and method name
+  (e.g. `tensorflow.keras.layers.Layer.get_config`). Unsupported or ambiguous
+  inheritance and explicit `super(...)` retain the original function name.
+  This does not identify the method's internal defining class.
+  Class decorators remain conservative, with a narrow exception for an
+  import-backed `tensorflow.keras.utils.register_keras_serializable(...)`
+  call using literal `package`/`name` configuration on a module-level class.
+  This requires a direct named import (including a symbol alias); wildcard
+  imports, visible rebinding, and module-attribute decorator calls remain
+  unsupported.
+  Its [registration implementation](https://github.com/tensorflow/tensorflow/blob/v2.10.0/tensorflow/python/keras/utils/generic_utils.py)
+  returns the original class; unknown or ambiguous decorators still prevent
+  expansion, including when stacked with this registration decorator.
 - `resolved_func` must not be treated as an importable symbol; it
   may not exist at that path in the library.
 
